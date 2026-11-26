@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 FreePVR Contributors
+"""
+freecs-validate — Clean-room PowerVR Volcanic Command-Stream & FW-ABI Validator CLI.
+
+Emits deterministic `freesilicon.twin.v1` JSON verdicts (domain: "freecs").
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from freepvr_twin.fixtures import build_valid_freecs_bundle
+from freepvr_twin.freecs import (
+    ROGUE_CCCB_CTL_SIZE,
+    ROGUE_CCCB_HDR_SIZE,
+    validate_bundle,
+)
+from freepvr_twin.reward import validate_verdict_schema
+
+
+def run_self_test() -> int:
+    """Run built-in positive and negative validation checks."""
+    base = build_valid_freecs_bundle()
+    v_ok = validate_bundle(base, workload="self-test-full-valid-bundle")
+    assert v_ok["pass"] is True, v_ok
+    assert v_ok["eval_ms"] < 5.0, f"exceeded 5ms budget: {v_ok['eval_ms']}ms"
+    assert not validate_verdict_schema(v_ok), validate_verdict_schema(v_ok)
+
+    neg_cases = []
+
+    # 1. 40B Rogue cCCB header drift
+    c1 = copy.deepcopy(base)
+    c1["fw_abi"]["cccb_hdr_size"] = ROGUE_CCCB_HDR_SIZE
+    neg_cases.append(("rogue-40b-cccb-hdr", c1, "FWABI_CCCB_HDR_ROGUE_40B"))
+
+    # 2. 16B Rogue CCCB_CTL drift
+    c2 = copy.deepcopy(base)
+    c2["fw_abi"]["cccb_ctl_size"] = ROGUE_CCCB_CTL_SIZE
+    neg_cases.append(("rogue-16b-cccb-ctl", c2, "FWABI_CCCB_CTL_ROGUE_16B"))
+
+    # 3. Retest #4 config_flags regression (0x00020004: HWPERF_EN set, POW_RASCALDUST missing)
+    c3 = copy.deepcopy(base)
+    c3["fw_abi"]["config_flags"] = 0x00020004
+    neg_cases.append(("laguna-config-flags-0x20004", c3, "FWABI_CONFIG_FLAGS_MISSING"))
+
+    # 4. Zero hwperf_ctl_dma_addr
+    c4 = copy.deepcopy(base)
+    c4["fw_abi"]["hwperf_ctl_dma_addr"] = {"dev_addr": 0, "fw_addr": 0}
+    neg_cases.append(("hwperf-dma-zero", c4, "FWABI_HWPERF_DMA_ZERO"))
+
+    # 5. Invalid DCE opcode 0x02
+    c5 = copy.deepcopy(base)
+    c5["dce"]["qwords"][0] = (0x02 << 56) | 0x1234
+    neg_cases.append(("dce-invalid-opcode", c5, "DCE_INVALID_OPCODE"))
+
+    # 6. Legacy Rogue inline PDS bit [6] in TA_STATE_HEADER
+    c6 = copy.deepcopy(base)
+    c6["ppp"]["words"][0] |= 1 << 6
+    neg_cases.append(("ppp-rogue-inline-pds", c6, "PPP_ROGUE_INLINE_PDS_BIT"))
+
+    # 7. Misaligned Pixel Shader Table base
+    c7 = copy.deepcopy(base)
+    c7["ppp"]["pixel_shader_table"]["base_addr"] = 0x8000500004
+    neg_cases.append(("ppp-pstbl-unaligned", c7, "PPP_PSTBL_UNALIGNED"))
+
+    # 8. PBE Rogue shift="2" VA mistake
+    c8 = copy.deepcopy(base)
+    exp_va = c8["pbe"]["expected_va"]
+    c8["pbe"]["state_words"][0] = (exp_va >> 2) & 0xFFFFFFFF
+    c8["pbe"]["state_words"][1] = (c8["pbe"]["state_words"][1] & ~0x3FFF) | (((exp_va >> 2) >> 32) & 0x1FFF)
+    neg_cases.append(("pbe-rogue-shift2", c8, "PBE_ROGUE_SHIFT2_VA"))
+
+    # 9. PDS DOUTD Rogue SLCMODE bit 62
+    c9 = copy.deepcopy(base)
+    c9["pds"]["doutd_src0"] |= 1 << 62
+    neg_cases.append(("pds-rogue-slcmode", c9, "PDS_DOUTD_ROGUE_SLCMODE_BIT62"))
+
+    # 10. TEXSTATE upstream 14b width/height spill into [62:57]
+    c10 = copy.deepcopy(base)
+    c10["texstate"]["image_words"][0] |= 1 << 60
+    neg_cases.append(("texstate-14b-drift", c10, "TEXSTATE_UPSTREAM_14B_WIDTH_HEIGHT_DRIFT"))
+
+    for name, payload, exp_code in neg_cases:
+        v = validate_bundle(payload, workload=f"neg-{name}")
+        assert v["pass"] is False, f"{name} unexpectedly passed"
+        assert v["eval_ms"] < 5.0, f"{name} exceeded 5ms: {v['eval_ms']}ms"
+        codes = [d["code"] for d in v["diagnostics"]]
+        assert exp_code in codes, f"{name} expected {exp_code}, got {codes}"
+        assert not validate_verdict_schema(v), validate_verdict_schema(v)
+
+    summary = {
+        "self_test": "PASS",
+        "positive_cases": 1,
+        "negative_cases": len(neg_cases),
+        "valid_bundle_eval_ms": v_ok["eval_ms"],
+        "sample_valid_verdict": v_ok,
+    }
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def run_bench(iters: int) -> int:
+    bundle = build_valid_freecs_bundle()
+    t0 = time.perf_counter()
+    passed = 0
+    for _ in range(iters):
+        v = validate_bundle(bundle, workload="bench-volcanic-bundle")
+        if v["pass"]:
+            passed += 1
+    elapsed_s = time.perf_counter() - t0
+    ms_per_eval = (elapsed_s * 1000.0) / max(1, iters)
+    evals_per_min = (iters / max(1e-9, elapsed_s)) * 60.0
+    print(
+        json.dumps(
+            {
+                "benchmark": "freecs-validate",
+                "iterations": iters,
+                "passed": passed,
+                "elapsed_ms": round(elapsed_s * 1000.0, 3),
+                "ms_per_eval": round(ms_per_eval, 5),
+                "evals_per_min": round(evals_per_min, 1),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="FreePVR Volcanic Command-Stream & FW-ABI Validator")
+    ap.add_argument("--input", type=Path, help="Path to JSON bundle or raw binary command stream")
+    ap.add_argument(
+        "--kind",
+        choices=("bundle", "cdm", "dce", "ppp"),
+        default="bundle",
+        help="Input interpretation (default: bundle JSON)",
+    )
+    ap.add_argument("--workload", default="cli-input", help="Workload name for verdict")
+    ap.add_argument(
+        "--target",
+        choices=("volcanic-dxt-48-1536", "volcanic-cxtp-48-1536"),
+        default="volcanic-dxt-48-1536",
+    )
+    ap.add_argument("--self-test", action="store_true", help="Run positive & negative self-test suite")
+    ap.add_argument("--bench", type=int, nargs="?", const=2000, help="Benchmark N validations (default 2000)")
+    args = ap.parse_args()
+
+    if args.self_test:
+        return run_self_test()
+    if args.bench is not None:
+        return run_bench(args.bench)
+    if args.input is None:
+        ap.print_help()
+        return 2
+
+    if args.kind == "bundle":
+        payload: Dict[str, Any] = json.loads(args.input.read_text())
+    else:
+        raw = args.input.read_bytes()
+        payload = {args.kind: raw}
+
+    verdict = validate_bundle(payload, workload=args.workload, target=args.target)
+    print(json.dumps(verdict, indent=2))
+    return 0 if verdict["pass"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -25,6 +25,7 @@ FreePVR packages these two clean-room tracks plus a 33-shader differential SPIR-
 | **`FreeCS` Specs** | [`spec/freecs/`](spec/freecs/VDM-PPP-CLEANROOM-SPEC.md) | 64-bit QWORD DCE (`vdm`), Volcanic `PPP_STATE` + 16B Pixel Shader Table, `RGX_CR_SOFT_RESET`, `S7_TOP` ISP/ZLS v2, `PBESTATE`, `TEXSTATE`, `CDM`/`PDS` deltas | Mesa `src/imagination/csbgen/volcanic/`, `pvr/`, Linux `drm/imagination` |
 | **`FreeUSC` Tools** | [`tools/freeusc/`](tools/freeusc/volcanic_bitdiff.py) | Offline Volcanic USC instruction framer, Vulkan pipeline-cache / `VK_KHR_pipeline_binary` bit-diff & opcode clusterer, `rgx.sh` container parser, 33-probe SPIR-V generator | Offline host verification & compiler bring-up |
 | **`FreeCS` Tools** | [`tools/freecs/`](tools/freecs/freecs_packet_validator.py) | Offline packer/decoder and proof-vector validator for DCE, `TA_STATE_HEADER`, `PBESTATE`, `TEXSTATE`, and `RGX_CR_SOFT_RESET` | `csbgen` XML cross-check |
+| **Digital Twin** | [`freepvr-twin/`](freepvr-twin/README.md) | Offline Volcanic CSB/FW-ABI validator (`freecs-validate`), 128-lane USC compute shader simulator (`freeusc-sim`), and `REWARD-SCHEMA.json` (`freesilicon.twin.v1`) | Offline kernel verification & RL reward oracle |
 | **Differential Probes** | [`probes/`](probes/CAPTURE-MANIFEST.md) | 33 clean-room GLSL 4.60 1-op paired-twin compute shaders (`local_size_x = 128`), standalone C11 Vulkan capture sweeper, on-device capture manifest | Pixel 10 (`DXT`) vs. Pixel 11 (`CXTP`) silicon validation |
 
 ---

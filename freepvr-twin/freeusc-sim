@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 FreePVR Contributors
+"""
+freeusc-sim — Clean-room 128-lane PowerVR Volcanic USC Compute Shader Simulator CLI.
+
+Emits deterministic `freesilicon.twin.v1` JSON verdicts (domain: "freeusc").
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import struct
+import sys
+import time
+from pathlib import Path
+from typing import List
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from freepvr_twin.fixtures import (
+    DEFAULT_SSBO_VA,
+    MESA_STAGE_G3B_FMA32_WORDS,
+    MESA_STAGE_G3B_IADD_SG_WORDS,
+    build_clean_atomic_kernel,
+    build_clean_bda_fma_kernel,
+    build_clean_bitwise_loop_barrier_kernel,
+    build_clean_subgroup_ballot_add_shuffle_kernel,
+    run_mesa_fma32,
+    run_mesa_iadd_sg,
+)
+from freepvr_twin.freeusc_isa import bytes_to_words, decode_stream
+from freepvr_twin.freeusc_sim import (
+    GlobalMemory,
+    SUBGROUP_SIZE,
+    VolcanicUSCState,
+    evaluate_compute_shader,
+)
+from freepvr_twin.reward import validate_verdict_schema
+
+
+def _run_clean_fixtures() -> dict:
+    results = {}
+
+    # 1. Clean BDA FMA
+    fma_w, _ = build_clean_bda_fma_kernel()
+    mem = GlobalMemory()
+    in_va, out_va = DEFAULT_SSBO_VA, DEFAULT_SSBO_VA + 0x1000
+    mem.map_region(in_va, 4096, struct.pack(f"<{SUBGROUP_SIZE}f", *[float(i) for i in range(SUBGROUP_SIZE)]))
+    mem.map_region(out_va, 4096)
+    st = VolcanicUSCState(
+        sh_init={
+            0: in_va & 0xFFFFFFFF,
+            1: (in_va >> 32) & 0xFFFFFFFF,
+            2: out_va & 0xFFFFFFFF,
+            3: (out_va >> 32) & 0xFFFFFFFF,
+        },
+        memory=mem,
+    )
+    results["clean_bda_fma"] = evaluate_compute_shader(
+        fma_w,
+        workload="clean-bda-fma",
+        state=st,
+        ssbo_va=out_va,
+        expected_f32=[float(i) * 2.0 + 1.0 for i in range(SUBGROUP_SIZE)],
+    )
+
+    # 2. Clean Bitwise + Loop + Barrier
+    blb_w = build_clean_bitwise_loop_barrier_kernel()
+    mem2 = GlobalMemory()
+    mem2.map_region(DEFAULT_SSBO_VA, 4096)
+    st2 = VolcanicUSCState(
+        sh_init={0: DEFAULT_SSBO_VA & 0xFFFFFFFF, 1: (DEFAULT_SSBO_VA >> 32) & 0xFFFFFFFF},
+        memory=mem2,
+    )
+    exp2 = [((4 * i) ^ 0xFF) >> 1 for i in range(SUBGROUP_SIZE)]
+    results["clean_bitwise_loop_barrier"] = evaluate_compute_shader(
+        blb_w,
+        workload="clean-bitwise-loop-barrier",
+        state=st2,
+        ssbo_va=DEFAULT_SSBO_VA,
+        expected_u32=exp2,
+    )
+
+    # 3. Clean 128-wide Subgroup Broadcast + Add + Shuffle + Ballot
+    sg_w = build_clean_subgroup_ballot_add_shuffle_kernel()
+    mem3 = GlobalMemory()
+    mem3.map_region(DEFAULT_SSBO_VA, 4096)
+    st3 = VolcanicUSCState(
+        sh_init={0: DEFAULT_SSBO_VA & 0xFFFFFFFF, 1: (DEFAULT_SSBO_VA >> 32) & 0xFFFFFFFF},
+        memory=mem3,
+    )
+    exp3: List[int] = []
+    for lane in range(SUBGROUP_SIZE):
+        exp3.extend([1042, 8128, 127 - lane, 0x55555555])
+    results["clean_subgroup_128wide"] = evaluate_compute_shader(
+        sg_w,
+        workload="clean-subgroup-128wide",
+        state=st3,
+        ssbo_va=DEFAULT_SSBO_VA,
+        expected_u32=exp3,
+    )
+
+    # 4. Clean Global BDA Atomic Add
+    at_w = build_clean_atomic_kernel()
+    mem4 = GlobalMemory()
+    mem4.map_region(DEFAULT_SSBO_VA, 64)
+    st4 = VolcanicUSCState(
+        sh_init={0: DEFAULT_SSBO_VA & 0xFFFFFFFF, 1: (DEFAULT_SSBO_VA >> 32) & 0xFFFFFFFF},
+        memory=mem4,
+    )
+    results["clean_bda_atomic_add"] = evaluate_compute_shader(
+        at_w,
+        workload="clean-bda-atomic-add",
+        state=st4,
+        ssbo_va=DEFAULT_SSBO_VA,
+        expected_u32=[8128],
+    )
+
+    return results
+
+
+def run_mesa_proof() -> int:
+    v_iadd = run_mesa_iadd_sg()
+    v_fma = run_mesa_fma32()
+    assert not validate_verdict_schema(v_iadd), validate_verdict_schema(v_iadd)
+    assert not validate_verdict_schema(v_fma), validate_verdict_schema(v_fma)
+    print(
+        json.dumps(
+            {
+                "mesa_stage_g3b_proof": {
+                    "fma32": v_fma,
+                    "iadd_sg": v_iadd,
+                }
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_self_test() -> int:
+    clean = _run_clean_fixtures()
+    for name, v in clean.items():
+        assert v["pass"] is True, f"{name} failed: {v}"
+        assert not validate_verdict_schema(v), validate_verdict_schema(v)
+
+    v_fma = run_mesa_fma32()
+    v_iadd = run_mesa_iadd_sg()
+    assert v_fma["pass"] is True and v_fma["max_abs_err"] == 0.0, v_fma
+    # Strict scientific integrity: iadd_sg MUST fail due to Mesa PCO_OP_SHIFT BIT06 bug at PC @32!
+    assert v_iadd["pass"] is False, "Expected iadd_sg to surface Mesa PCO_OP_SHIFT bug at @32"
+    assert any(d["code"] == "USC_BIT_SHIFT_LUT_SRC_MISMATCH" for d in v_iadd["diagnostics"]), v_iadd
+
+    print(
+        json.dumps(
+            {
+                "self_test": "PASS",
+                "clean_kernels_passed": len(clean),
+                "mesa_fma32_pass": v_fma["pass"],
+                "mesa_fma32_max_abs_err": v_fma["max_abs_err"],
+                "mesa_iadd_sg_pass": v_iadd["pass"],
+                "mesa_iadd_sg_fault": v_iadd["fault_reason"],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def run_bench(iters: int) -> int:
+    t0 = time.perf_counter()
+    passed = 0
+    for _ in range(iters):
+        v = run_mesa_fma32()
+        if v["pass"]:
+            passed += 1
+    elapsed_s = time.perf_counter() - t0
+    ms_per_eval = (elapsed_s * 1000.0) / max(1, iters)
+    evals_per_min = (iters / max(1e-9, elapsed_s)) * 60.0
+    print(
+        json.dumps(
+            {
+                "benchmark": "freeusc-sim (128-lane mesa-stage-g3b-fma32)",
+                "iterations": iters,
+                "passed": passed,
+                "elapsed_ms": round(elapsed_s * 1000.0, 3),
+                "ms_per_eval": round(ms_per_eval, 5),
+                "evals_per_min": round(evals_per_min, 1),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="FreePVR 128-lane Volcanic USC Compute Simulator")
+    ap.add_argument("--bin", type=Path, help="Raw LE 32-bit dword Volcanic USC binary file")
+    ap.add_argument("--hex", help="Space-separated hex 32-bit dwords")
+    ap.add_argument(
+        "--fixture",
+        choices=("iadd_sg", "fma32", "clean_bda_fma", "clean_bitwise_loop", "clean_subgroup", "clean_atomic"),
+        help="Run a built-in shader fixture",
+    )
+    ap.add_argument("--disasm", action="store_true", help="Disassemble instructions per hardware ISA spec")
+    ap.add_argument("--mesa-proof", action="store_true", help="Run Mesa Stage G3B iadd_sg & fma32 proof")
+    ap.add_argument("--self-test", action="store_true", help="Run full offline simulator self-test suite")
+    ap.add_argument("--bench", type=int, nargs="?", const=500, help="Benchmark N 128-lane simulations")
+    ap.add_argument("--workload", default="cli-usc-shader")
+    ap.add_argument(
+        "--target",
+        choices=("volcanic-dxt-48-1536", "volcanic-cxtp-48-1536"),
+        default="volcanic-dxt-48-1536",
+    )
+    args = ap.parse_args()
+
+    if args.self_test:
+        return run_self_test()
+    if args.mesa_proof:
+        return run_mesa_proof()
+    if args.bench is not None:
+        return run_bench(args.bench)
+
+    words: List[int] = []
+    if args.bin is not None:
+        words = bytes_to_words(args.bin.read_bytes())
+    elif args.hex is not None:
+        words = [int(tok, 16) for tok in args.hex.replace(",", " ").split()]
+    elif args.fixture is not None:
+        if args.disasm:
+            fmap = {
+                "iadd_sg": list(MESA_STAGE_G3B_IADD_SG_WORDS),
+                "fma32": list(MESA_STAGE_G3B_FMA32_WORDS),
+                "clean_bda_fma": build_clean_bda_fma_kernel()[0],
+                "clean_bitwise_loop": build_clean_bitwise_loop_barrier_kernel(),
+                "clean_subgroup": build_clean_subgroup_ballot_add_shuffle_kernel(),
+                "clean_atomic": build_clean_atomic_kernel(),
+            }
+            words = fmap[args.fixture]
+        else:
+            if args.fixture == "iadd_sg":
+                v = run_mesa_iadd_sg()
+            elif args.fixture == "fma32":
+                v = run_mesa_fma32()
+            else:
+                clean = _run_clean_fixtures()
+                key_map = {
+                    "clean_bda_fma": "clean_bda_fma",
+                    "clean_bitwise_loop": "clean_bitwise_loop_barrier",
+                    "clean_subgroup": "clean_subgroup_128wide",
+                    "clean_atomic": "clean_bda_atomic_add",
+                }
+                v = clean[key_map[args.fixture]]
+            print(json.dumps(v, indent=2))
+            return 0 if v["pass"] else 1
+    else:
+        ap.print_help()
+        return 2
+
+    if args.disasm:
+        insts, errs = decode_stream(words)
+        for inst in insts:
+            raw = " ".join(f"{w:08x}" for w in inst.raw_words)
+            print(f"@{inst.pc:03d} [{inst.length}w] {inst.format_asm():58s} | {raw}")
+        if errs:
+            for e in errs:
+                print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+        return 0
+
+    verdict = evaluate_compute_shader(words, workload=args.workload, target=args.target)
+    print(json.dumps(verdict, indent=2))
+    return 0 if verdict["pass"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
