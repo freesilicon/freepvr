@@ -16,9 +16,13 @@ from .freecs import (
     LAGUNA_CCCB_CTL_SIZE,
     LAGUNA_CCCB_HDR_SIZE,
     LAGUNA_INICFG_DEFAULT,
+    MMUV4_AXCACHE_UNCACHED,
     TA_HEADER_SINGLE_VP_PROOF,
     VOLCANIC_IRQ_OS0_EVENT_CLEAR_OFFSET,
     VOLCANIC_SOFT_RESET_GARTEN_EN,
+    encode_mmuv4_pce,
+    encode_mmuv4_pde,
+    encode_mmuv4_pte,
 )
 from .freeusc_isa import (
     AtomOp,
@@ -370,6 +374,12 @@ def build_valid_freecs_bundle() -> Dict[str, Any]:
             "hwperf_ctl_dma_addr": {"dev_addr": 0x8000010000, "fw_addr": 0xC0010000},
             "soft_reset": VOLCANIC_SOFT_RESET_GARTEN_EN,
             "irq_os0_event_clear_offset": VOLCANIC_IRQ_OS0_EVENT_CLEAR_OFFSET,
+            "cmd_cdm": {
+                "size_bytes": 120,
+                "cdm_ctrl_stream_base": 0x8000068000,
+                "cdm_context_state_base_addr": 0x8000043000,
+                "cdm_stack_state_base": 0x8000043800,
+            },
         },
         "cdm": {"words": [k0, k1, k2, k3, k4, k5, k8, k9, cdm_term]},
         "dce": {
@@ -401,5 +411,17 @@ def build_valid_freecs_bundle() -> Dict[str, Any]:
             "expected_va": tex_va,
             "expected_samples": 4,
             "sampler_word1": 0x3A5,
+        },
+        "mmuv4": {
+            "gpu_dma_coherent": False,
+            "pt_sync_flushed": True,
+            "pc_base_pa": 0x88EFE7000,
+            "walk_va": 0x8000068000,
+            "pce": encode_mmuv4_pce(0x88EFE8000),
+            "expected_pd_pa": 0x88EFE8000,
+            "pde": encode_mmuv4_pde(0x88EFE9000),
+            "expected_pt_pa": 0x88EFE9000,
+            "pte": encode_mmuv4_pte(0x88EFEA000, axcache=MMUV4_AXCACHE_UNCACHED),
+            "expected_page_pa": 0x88EFEA000,
         },
     }

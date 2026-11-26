@@ -33,6 +33,11 @@ LAGUNA_CCCB_HDR_SIZE = 16
 ROGUE_CCCB_HDR_SIZE = 40
 LAGUNA_CCCB_CTL_SIZE = 32
 ROGUE_CCCB_CTL_SIZE = 16
+LAGUNA_CMDCDM_SIZE = 120
+VOLCANIC_CDM_CTX_STATE_SIZE = 0x400    # 1024 B, 128 B-aligned (CR 0x0498)
+VOLCANIC_CDM_CTX_STATE_ALIGN = 0x80
+VOLCANIC_CDM_STACK_STATE_SIZE = 0x800  # 2048 B, 256 B-aligned (CR 0x0598 / CMDCDM+0x20)
+VOLCANIC_CDM_STACK_STATE_ALIGN = 0x100
 
 LAGUNA_INICFG_HWPERF_EN = 1 << 2
 LAGUNA_INICFG_POW_RASCALDUST = 1 << 4
@@ -297,6 +302,69 @@ def validate_fw_abi(spec: Dict[str, Any], diags: List[Diagnostic], checks: Dict[
                 f"IRQ_OS0_EVENT_CLEAR offset 0x{irq_off:04x} != 0x{VOLCANIC_IRQ_OS0_EVENT_CLEAR_OFFSET:04x} (legacy 0x0BD8 drift)",
                 field="IRQ_OS0_EVENT_CLEAR",
             )
+
+    if "cmd_cdm" in spec:
+        cmd_cdm = spec["cmd_cdm"]
+        if "size_bytes" in cmd_cdm:
+            sz = int(cmd_cdm["size_bytes"])
+            if sz != LAGUNA_CMDCDM_SIZE:
+                ok = False
+                _err(
+                    diags,
+                    "FWABI_CMDCDM_SIZE",
+                    f"CMDCDM payload size {sz} != {LAGUNA_CMDCDM_SIZE}B (136B with 16B Laguna cCCB header)",
+                    field="cmd_cdm.size_bytes",
+                )
+        cs_base = int(cmd_cdm.get("cdm_ctrl_stream_base", 0))
+        if cs_base == 0 or (cs_base & 0x3) != 0 or cs_base >= (1 << 40):
+            ok = False
+            _err(
+                diags,
+                "CMDCDM_CTRL_STREAM_BASE_INVALID",
+                f"cdm_ctrl_stream_base=0x{cs_base:x} must be non-zero 4B-aligned 40-bit GPU VA (CR 0x04e8)",
+                field="cmd_cdm.cdm_ctrl_stream_base",
+            )
+        ctx_base = int(cmd_cdm.get("cdm_context_state_base_addr", 0))
+        if ctx_base == 0 or (ctx_base & (VOLCANIC_CDM_CTX_STATE_ALIGN - 1)) != 0 or ctx_base >= (1 << 40):
+            ok = False
+            _err(
+                diags,
+                "CMDCDM_CTX_STATE_BASE_INVALID",
+                f"cdm_context_state_base_addr=0x{ctx_base:x} must be non-zero 128B-aligned 40-bit GPU VA (CR 0x0498)",
+                field="cmd_cdm.cdm_context_state_base_addr",
+            )
+        # CMDCDM + 0x20 (regs + 0x18 -> CR 0x0598/0x059c): Volcanic CDM Stack State Base (2048B, 256B-aligned).
+        # Leaving this 0 (Rogue non-UMQ cdm_cb_queue omission) faults hardware CDM(0x1b) at va=0x180!
+        stack_base = int(cmd_cdm.get("cdm_stack_state_base", cmd_cdm.get("cdm_cb_queue", 0)))
+        if stack_base == 0:
+            ok = False
+            _err(
+                diags,
+                "CMDCDM_STACK_STATE_BASE_ZERO",
+                "CMDCDM+0x20 (CR 0x0598 Volcanic CDM Stack State Base) is 0; hardware CDM(0x1b) faults at va=0x180 (non-zero 2048B, 256B-aligned GPU R/W scratchpad required)",
+                field="cmd_cdm.cdm_stack_state_base",
+            )
+        else:
+            if (stack_base & (VOLCANIC_CDM_STACK_STATE_ALIGN - 1)) != 0 or stack_base >= (1 << 40):
+                ok = False
+                _err(
+                    diags,
+                    "CMDCDM_STACK_STATE_UNALIGNED",
+                    f"cdm_stack_state_base=0x{stack_base:x} must be 256B-aligned 40-bit GPU VA (CR 0x0598)",
+                    field="cmd_cdm.cdm_stack_state_base",
+                )
+            if ctx_base != 0:
+                ctx_end = ctx_base + VOLCANIC_CDM_CTX_STATE_SIZE
+                stack_end = stack_base + VOLCANIC_CDM_STACK_STATE_SIZE
+                if not (stack_end <= ctx_base or stack_base >= ctx_end):
+                    ok = False
+                    _err(
+                        diags,
+                        "CMDCDM_STACK_STATE_OVERLAPS_CTX_STATE",
+                        f"CDM Stack State [0x{stack_base:x}, 0x{stack_end:x}) overlaps 1024B CDM Context State [0x{ctx_base:x}, 0x{ctx_end:x})",
+                        field="cmd_cdm.cdm_stack_state_base",
+                    )
+        checks["cmd_cdm_stack_state_base"] = f"0x{stack_base:x}"
 
     checks["fw_abi_ok"] = ok
 
@@ -1144,6 +1212,265 @@ def validate_pds_texstate(spec: Dict[str, Any], diags: List[Diagnostic], checks:
 
 
 # ---------------------------------------------------------------------------
+# 7. Volcanic MMUv4 Page-Table Walk, PxE Encoding & Laguna Coherency Validator
+# ---------------------------------------------------------------------------
+
+MMUV4_VA_BITS = 40
+MMUV4_PA_BITS = 40
+MMUV4_AXCACHE_SHIFT = 58
+MMUV4_AXCACHE_MASK = 0xF << MMUV4_AXCACHE_SHIFT
+MMUV4_AXCACHE_UNCACHED = 0x3  # Normal Non-Cacheable Bufferable
+MMUV4_AXCACHE_CACHED = 0xF    # Write-Back Read/Write-Allocate
+
+MMUV4_LEVEL_NAMES = {0: "PT", 1: "PD", 2: "PC", 3: "RSVD"}
+
+
+def _jones_req_name(req_id: int) -> str:
+    if req_id == 0x00:
+        return "IPP"
+    if 0x01 <= req_id <= 0x0E:
+        return "DCE"
+    if 0x0F <= req_id <= 0x13:
+        return "TDM"
+    if req_id == 0x14:
+        return "PM"
+    if 0x15 <= req_id <= 0x1F:
+        return "CDM"
+    if req_id == 0x20:
+        return "FW"
+    if req_id == 0x21:
+        return "FW_DMA"
+    if 0x22 <= req_id <= 0x31:
+        return "TE"
+    if 0x32 <= req_id <= 0x34:
+        return "RCE"
+    return f"REQ_0x{req_id:02x}"
+
+
+def decode_mmu_fault_status(status1: int, status2: int) -> Dict[str, Any]:
+    """Decode Volcanic S7_TOP MMU_FAULT_STATUS1 (0xE150) & STATUS2 (0xE158)."""
+    s1 = int(status1) & 0xFFFFFFFFFFFFFFFF
+    s2 = int(status2) & 0xFFFFFFFFFFFFFFFF
+    level = (s1 >> 62) & 0x3
+    req_id = (s1 >> 56) & 0x3F
+    pc_ctx = (s1 >> 48) & 0xFF
+    va = s1 & 0x0000FFFFFFFFFFF0
+    rnw = bool((s1 >> 3) & 1)
+    ftype = (s1 >> 1) & 0x3
+    valid = bool(s1 & 1)
+    bank = (s2 >> 12) & 0xFF
+    wb = bool((s2 >> 20) & 1)
+    fbm = bool((s2 >> 21) & 1)
+    req_name = _jones_req_name(req_id) if bank == 8 else f"BANK{bank}_0x{req_id:02x}"
+    return {
+        "valid": valid,
+        "read": rnw,
+        "type": ftype,
+        "va": va,
+        "pc_ctx": pc_ctx,
+        "req_id": req_id,
+        "req_name": req_name,
+        "level": level,
+        "level_name": MMUV4_LEVEL_NAMES.get(level, "UNK"),
+        "bank": bank,
+        "writeback": wb,
+        "fbm_fault": fbm,
+    }
+
+
+def encode_mmuv4_pce(pd_pa: int, *, valid: bool = True) -> int:
+    """Encode 32-bit Volcanic MMUv4 L2 Page Catalogue Entry (PD_BASE[31:4] | VALID[0])."""
+    return (((int(pd_pa) >> 12) & 0xFFFFFFF) << 4) | (1 if valid else 0)
+
+
+def encode_mmuv4_pde(pt_pa: int, *, valid: bool = True) -> int:
+    """Encode 64-bit Volcanic MMUv4 L1 Page Directory Entry (PT_BASE[39:12] | VALID[0])."""
+    return (int(pt_pa) & 0xFFFFFFF000) | (1 if valid else 0)
+
+
+def encode_mmuv4_pte(
+    page_pa: int,
+    *,
+    valid: bool = True,
+    read_only: bool = False,
+    coherent: bool = False,
+    pm_src: bool = False,
+    pm_meta_protect: bool = False,
+    axcache: int = MMUV4_AXCACHE_UNCACHED,
+) -> int:
+    """Encode 64-bit Volcanic MMUv4 L0 Page Table Entry with AXCACHE[61:58]."""
+    val = int(page_pa) & 0xFFFFFFF000
+    if valid:
+        val |= 1 << 0
+    if read_only:
+        val |= 1 << 1
+    if coherent:
+        val |= 1 << 2
+    if pm_src:
+        val |= 1 << 4
+    if pm_meta_protect:
+        val |= 1 << 62
+    val |= (int(axcache) & 0xF) << MMUV4_AXCACHE_SHIFT
+    return val
+
+
+def validate_mmuv4(
+    mmu: Dict[str, Any],
+    diags: List[Diagnostic],
+    checks: Dict[str, Any],
+) -> None:
+    """Validate Volcanic MMUv4 PxE bitfields, Laguna non-coherent DMA, and 3-level VA walk."""
+    ok = True
+
+    if mmu.get("gpu_dma_coherent") is True:
+        ok = False
+        _err(
+            diags,
+            "MMUV4_LAGUNA_FALSE_DMA_COHERENT",
+            "gpu0 declares dma-coherent=true, but Laguna DXT-48-1536 has eCacheSnoopingMode=0 "
+            "(non-coherent); ARM64 dma_sync becomes a no-op, leaving PC/PD/PT writes in CPU cache "
+            "and causing immediate level=PC(2) translation faults",
+            field="mmu.gpu_dma_coherent",
+        )
+
+    if mmu.get("pt_sync_flushed") is False:
+        ok = False
+        _err(
+            diags,
+            "MMUV4_UNFLUSHED_PT_DRAM",
+            "Page table updates not flushed to DRAM before GPU kick; non-coherent MMUv4 walker sees stale zeros",
+            field="mmu.pt_sync_flushed",
+        )
+
+    pc_base_pa = mmu.get("pc_base_pa")
+    if pc_base_pa is not None:
+        pa = int(pc_base_pa)
+        if pa == 0 or (pa & 0xFFF) != 0 or pa >= (1 << MMUV4_PA_BITS):
+            ok = False
+            _err(
+                diags,
+                "MMUV4_PC_BASE_INVALID",
+                f"pc_base_pa=0x{pa:x} must be non-zero, 4KiB-aligned, and within 40-bit PA",
+                field="mmu.pc_base_pa",
+            )
+
+    if "fault_status1" in mmu or "fault_status2" in mmu:
+        dec = decode_mmu_fault_status(mmu.get("fault_status1", 0), mmu.get("fault_status2", 0))
+        checks["mmuv4_decoded_fault"] = dec
+
+    pce_val = mmu.get("pce")
+    pde_val = mmu.get("pde")
+    pte_val = mmu.get("pte")
+
+    walk_va = mmu.get("walk_va")
+    if walk_va is not None:
+        va = int(walk_va)
+        if va >= (1 << MMUV4_VA_BITS):
+            ok = False
+            _err(diags, "MMUV4_VA_OUT_OF_RANGE", f"walk_va=0x{va:x} exceeds 40-bit Volcanic VA", field="mmu.walk_va")
+        checks["mmuv4_walk_indices"] = {
+            "pc_idx": (va >> 30) & 0x3FF,
+            "pd_idx": (va >> 21) & 0x1FF,
+            "pt_idx": (va >> 12) & 0x1FF,
+            "page_off": va & 0xFFF,
+        }
+
+    if pce_val is not None:
+        pce = int(pce_val)
+        if pce < 0 or pce > 0xFFFFFFFF:
+            ok = False
+            _err(diags, "MMUV4_PCE_WIDTH", f"MMUv4 PC entry must be 32-bit, got 0x{pce:x}", field="mmu.pce")
+        if (pce & 1) == 0:
+            ok = False
+            _err(diags, "MMUV4_PC_FAULT_INVALID", f"PCE=0x{pce:08x} VALID bit 0 clear -> level=PC(2) fault", field="mmu.pce")
+        if (pce >> 1) & 1:
+            ok = False
+            _err(diags, "MMUV4_PC_ROGUE_PENDING_BIT", f"PCE=0x{pce:08x} sets Rogue PENDING bit 1 (dropped in MMUv4)", field="mmu.pce")
+        if (pce >> 2) & 0x3:
+            ok = False
+            _err(diags, "MMUV4_PC_RSVD_BITS", f"PCE=0x{pce:08x} has reserved bits [3:2] set", field="mmu.pce")
+        pd_pa_from_pce = ((pce >> 4) & 0xFFFFFFF) << 12
+        checks["mmuv4_pce_pd_pa"] = f"0x{pd_pa_from_pce:x}"
+        if "expected_pd_pa" in mmu and pd_pa_from_pce != int(mmu["expected_pd_pa"]):
+            ok = False
+            _err(
+                diags,
+                "MMUV4_PCE_PD_PA_MISMATCH",
+                f"PCE PD_BASE=0x{pd_pa_from_pce:x} != expected 0x{int(mmu['expected_pd_pa']):x}",
+                field="mmu.pce",
+            )
+
+    if pde_val is not None:
+        pde = int(pde_val) & 0xFFFFFFFFFFFFFFFF
+        if (pde & 1) == 0:
+            ok = False
+            _err(diags, "MMUV4_PD_FAULT_INVALID", f"PDE=0x{pde:016x} VALID bit 0 clear -> level=PD(1) fault", field="mmu.pde")
+        if (pde >> 40) & 1:
+            ok = False
+            _err(diags, "MMUV4_PD_ROGUE_PENDING_BIT", f"PDE=0x{pde:016x} sets Rogue ENTRY_PENDING bit 40 (dropped in MMUv4)", field="mmu.pde")
+        if (pde >> 1) & 0x7:
+            ok = False
+            _err(
+                diags,
+                "MMUV4_PD_ROGUE_PAGESIZE_BITS",
+                f"PDE=0x{pde:016x} sets Rogue PAGE_SIZE[3:1]={((pde >> 1) & 0x7)} (MMUv4 uses MMU_PAGE_SIZE_RANGE)",
+                field="mmu.pde",
+            )
+        pt_pa_from_pde = pde & 0xFFFFFFFFF0
+        if (pt_pa_from_pde & 0xFFF) != 0:
+            ok = False
+            _err(diags, "MMUV4_PDE_PT_PA_UNALIGNED", f"PDE PT_BASE=0x{pt_pa_from_pde:x} not 4KiB aligned", field="mmu.pde")
+        checks["mmuv4_pde_pt_pa"] = f"0x{pt_pa_from_pde:x}"
+        if "expected_pt_pa" in mmu and pt_pa_from_pde != int(mmu["expected_pt_pa"]):
+            ok = False
+            _err(
+                diags,
+                "MMUV4_PDE_PT_PA_MISMATCH",
+                f"PDE PT_BASE=0x{pt_pa_from_pde:x} != expected 0x{int(mmu['expected_pt_pa']):x}",
+                field="mmu.pde",
+            )
+
+    if pte_val is not None:
+        pte = int(pte_val) & 0xFFFFFFFFFFFFFFFF
+        if (pte & 1) == 0:
+            ok = False
+            _err(diags, "MMUV4_PT_FAULT_INVALID", f"PTE=0x{pte:016x} VALID bit 0 clear -> level=PT(0) fault", field="mmu.pte")
+        if (pte >> 3) & 1:
+            ok = False
+            _err(
+                diags,
+                "MMUV4_PT_ROGUE_SLC_BYPASS_BIT",
+                f"PTE=0x{pte:016x} sets Rogue SLC_BYPASS bit 3 (MMUv4 uses AXCACHE[61:58])",
+                field="mmu.pte",
+            )
+        if (pte >> 5) & 1:
+            ok = False
+            _err(diags, "MMUV4_PT_ROGUE_PENDING_BIT", f"PTE=0x{pte:016x} sets Rogue PENDING bit 5 (dropped in MMUv4)", field="mmu.pte")
+        axcache = (pte >> MMUV4_AXCACHE_SHIFT) & 0xF
+        if axcache not in (MMUV4_AXCACHE_UNCACHED, MMUV4_AXCACHE_CACHED):
+            ok = False
+            _err(
+                diags,
+                "MMUV4_PT_AXCACHE_INVALID",
+                f"PTE AXCACHE[61:58]=0x{axcache:x} not in {{0x3 (uncached), 0xf (cached)}}",
+                field="mmu.pte.axcache",
+            )
+        page_pa = pte & 0xFFFFFFF000
+        checks["mmuv4_pte_page_pa"] = f"0x{page_pa:x}"
+        checks["mmuv4_pte_axcache"] = f"0x{axcache:x}"
+        if "expected_page_pa" in mmu and page_pa != int(mmu["expected_page_pa"]):
+            ok = False
+            _err(
+                diags,
+                "MMUV4_PTE_PA_MISMATCH",
+                f"PTE page PA=0x{page_pa:x} != expected 0x{int(mmu['expected_page_pa']):x}",
+                field="mmu.pte",
+            )
+
+    checks["mmuv4_ok"] = ok
+
+
+# ---------------------------------------------------------------------------
 # Unified Validation Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -1153,7 +1480,7 @@ def validate_bundle(
     workload: str = "volcanic-cs-bundle",
     target: str = "volcanic-dxt-48-1536",
 ) -> Dict[str, Any]:
-    """Validate any combination of FW-ABI, CDM, DCE, PPP, PBE/ISP/ZLS, PDS/TEXSTATE."""
+    """Validate any combination of FW-ABI, CDM, DCE, PPP, PBE/ISP/ZLS, PDS/TEXSTATE, MMUv4."""
     t0 = time.perf_counter()
     diags: List[Diagnostic] = []
     checks: Dict[str, Any] = {}
@@ -1198,6 +1525,8 @@ def validate_bundle(
         validate_pbe_isp_zls(payload, diags, checks)
     if any(k in payload for k in ("pds", "texstate")):
         validate_pds_texstate(payload, diags, checks)
+    if "mmuv4" in payload:
+        validate_mmuv4(payload["mmuv4"], diags, checks)
 
     if not checks:
         _err(diags, "FREECS_EMPTY_PAYLOAD", "No recognized Volcanic command-stream sections in input")
