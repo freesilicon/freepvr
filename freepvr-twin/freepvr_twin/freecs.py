@@ -88,7 +88,7 @@ TA_HEADER_SINGLE_VP_PROOF = 0x00FF0D87
 TA_HEADER_TERMINATE_PROOF = 0x02000000
 
 VALID_TE_AA_MODES = frozenset({0, 1, 5, 7})
-VALID_PDS_DOUT_OPCODES = frozenset({0xF0000000, 0xF0000002, 0xF0000004})
+VALID_PDS_DOUT_OPCODES = frozenset({0xF0000000, 0xF0000001, 0xF0000002, 0xF0000003, 0xF0000004})
 
 
 def _to_u32_list(data: Any) -> List[int]:
@@ -373,8 +373,21 @@ def validate_fw_abi(spec: Dict[str, Any], diags: List[Diagnostic], checks: Dict[
 # 2. CDM (Compute Data Master) Stream Validator
 # ---------------------------------------------------------------------------
 
-def validate_cdm_stream(words_in: Any, diags: List[Diagnostic], checks: Dict[str, Any], require_terminate: bool = True) -> None:
-    """Validate Volcanic CDM control stream dwords."""
+def validate_cdm_stream(
+    words_in: Any,
+    diags: List[Diagnostic],
+    checks: Dict[str, Any],
+    require_terminate: bool = True,
+    is_substream: bool = False,
+) -> None:
+    """Validate Volcanic CDM control stream dwords.
+
+    On Volcanic (DXT-48-1536), CDMCTRL block_type=2 (0x80000000) is STREAM_RETURN
+    (pops a return address from CR 0x0598 CDM Stack State + 0x180), NOT primary
+    STREAM_TERMINATE. Primary CDM control streams MUST terminate via an 8-dword
+    COMPUTE_KERNEL_EXT (block_type=3) + BIT(28) (event_object_present/terminate)
+    dealloc-fence-and-terminate block (0xD0000000 / 0xD8000000).
+    """
     ok = True
     try:
         words = _to_u32_list(words_in)
@@ -392,17 +405,36 @@ def validate_cdm_stream(words_in: Any, diags: List[Diagnostic], checks: Dict[str
     kernels = 0
     ext_kernels = 0
     terminated = False
+    returned = False
 
     while i < len(words):
         w0 = words[i]
         block_type = (w0 >> 30) & 0x3
         off_bytes = i * 4
 
-        if block_type == 2:  # CDMCTRL_STREAM_TERMINATE
-            terminated = True
+        if block_type == 2:  # Volcanic CDMCTRL_STREAM_RETURN (0x80000000)
+            if is_substream:
+                returned = True
+                terminated = True
+                i += 1
+                if i < len(words):
+                    _warn(diags, "CDM_TRAILING_AFTER_TERM", f"{len(words) - i} trailing dwords after STREAM_RETURN", offset=i * 4)
+                break
+            if terminated:
+                # Trailing legacy 0x80000000 after an explicit block_type=3 + BIT(28) terminate block
+                _warn(diags, "CDM_TRAILING_AFTER_TERM", f"{len(words) - i} trailing dwords after primary terminate kernel", offset=off_bytes)
+                break
+            ok = False
+            _err(
+                diags,
+                "CDM_PRIMARY_STREAM_RETURN_FAULT",
+                "Primary CDM stream uses block_type=2 (0x80000000), which is STREAM_RETURN on Volcanic "
+                "(pops zeroed entry from CR 0x0598 + 0x180 -> CDM(0x15) read fault at va=0x0); "
+                "terminate primary streams with 8-dword block_type=3 + BIT(28) dealloc-fence kernel",
+                offset=off_bytes,
+                field="KERNEL0.block_type",
+            )
             i += 1
-            if i < len(words):
-                _warn(diags, "CDM_TRAILING_AFTER_TERM", f"{len(words) - i} trailing dwords after STREAM_TERMINATE", offset=i * 4)
             break
 
         if block_type == 1:  # STREAM_LINK (2 dwords)
@@ -421,11 +453,11 @@ def validate_cdm_stream(words_in: Any, diags: List[Diagnostic], checks: Dict[str
         if block_type in (0, 3):  # COMPUTE_KERNEL / COMPUTE_KERNEL_EXT
             indirect = (w0 >> 29) & 1
             event_obj = (w0 >> 28) & 1
+            wg_mode = (w0 >> 20) & 0x3
             usc_unified_size = (w0 >> 12) & 0xFF
             pds_temp_size = (w0 >> 7) & 0x1F
             pds_data_size = (w0 >> 1) & 0x3F
             # Direct kernel: K0, K1, K2, K3, K4, K5, K8, K9 = 8 dwords (indirect: K0, K1, K2, K6, K7, K8, K9 = 7 dwords)
-            # Note: some streams omit K9 when workgroup_size is not emitted, check >= 7/8
             needed = 7 if indirect else 8
             if i + needed > len(words):
                 ok = False
@@ -466,8 +498,8 @@ def validate_cdm_stream(words_in: Any, diags: List[Diagnostic], checks: Dict[str
                 k8 = words[i + 6]
                 k9 = words[i + 7]
 
-            max_inst_m1 = (k8 >> 25) & 0x7F
-            max_instances = max_inst_m1 + 1
+            max_inst_raw = (k8 >> 25) & 0x7F
+            max_instances = 128 if max_inst_raw == 0 else max_inst_raw
             event_type = (k8 >> 11) & 0x3
             usc_common_size = k8 & 0x7FF
 
@@ -501,21 +533,51 @@ def validate_cdm_stream(words_in: Any, diags: List[Diagnostic], checks: Dict[str
                     offset=off_bytes + (needed - 1) * 4,
                     field="workgroup_size",
                 )
+            if block_type == 0 and not usc_common_shared and (ws_x * ws_y * ws_z) == 128 and wg_mode == 0:
+                _warn(
+                    diags,
+                    "CDM_WG128_WG_MODE_ZERO",
+                    "128-invocation compute kernel leaves KERNEL0.wg_mode=0 (Volcanic DXT-48-1536 expects wg_mode=1 / BIT(20) for 128-thread workgroups)",
+                    offset=off_bytes,
+                    field="KERNEL0.wg_mode",
+                )
 
             kernels += 1
             if block_type == 3:
                 ext_kernels += 1
+                if event_obj:
+                    terminated = True
+                    if sd_type != 1 or not usc_common_shared:
+                        _warn(
+                            diags,
+                            "CDM_TERM_KERNEL_DEALLOC_FENCE_FLAGS",
+                            f"Primary terminate kernel (block_type=3 + BIT(28)) has sd_type={sd_type}, usc_common_shared={usc_common_shared} "
+                            "(expected sd_type=1(PDS), usc_common_shared=1 for Volcanic dealloc-fence)",
+                            offset=off_bytes + 4,
+                            field="KERNEL1",
+                        )
             i += needed
+            if terminated and not is_substream and i < len(words):
+                _warn(diags, "CDM_TRAILING_AFTER_TERM", f"{len(words) - i} trailing dwords after primary terminate kernel", offset=i * 4)
+                break
             continue
 
     if require_terminate and not terminated:
         ok = False
-        _err(diags, "CDM_MISSING_TERMINATE", "CDM stream missing CDMCTRL_STREAM_TERMINATE (block_type=2)", offset=len(words) * 4)
+        _err(
+            diags,
+            "CDM_MISSING_TERMINATE",
+            "CDM stream missing primary terminate kernel (block_type=3 + BIT(28))"
+            if not is_substream
+            else "CDM sub-stream missing STREAM_RETURN (block_type=2 / 0x80000000)",
+            offset=len(words) * 4,
+        )
 
     checks["cdm_ok"] = ok
     checks["cdm_kernels"] = kernels
     checks["cdm_ext_kernels"] = ext_kernels
     checks["cdm_terminated"] = terminated
+    checks["cdm_returned"] = returned
 
 
 # ---------------------------------------------------------------------------
@@ -1113,13 +1175,14 @@ def validate_pds_texstate(spec: Dict[str, Any], diags: List[Diagnostic], checks:
         if "doutd_src1" in pds:
             d1 = int(pds["doutd_src1"]) & 0xFFFFFFFF
             bsize = d1 & 0xFFF
-            rsvd = (d1 >> 12) & 0xFFFF
+            rsvd_bit12 = (d1 >> 12) & 1
+            rsvd_hi = (d1 >> 26) & 0x3
             if bsize == 0:
                 ok = False
                 _err(diags, "PDS_DOUTD_ZERO_BSIZE", "DOUTD SRC1 bsize[11:0] is 0", field="DOUTD_SRC1.bsize")
-            if rsvd != 0:
+            if rsvd_bit12 != 0 or rsvd_hi != 0:
                 ok = False
-                _err(diags, "PDS_DOUTD_SRC1_RSVD", f"DOUTD SRC1 reserved bits [27:12] non-zero (0x{d1:08x})", field="DOUTD_SRC1")
+                _err(diags, "PDS_DOUTD_SRC1_RSVD", f"DOUTD SRC1 reserved bits [27:26,12] non-zero (0x{d1:08x})", field="DOUTD_SRC1")
 
         if "dout_insts" in pds:
             for idx, inst in enumerate(_to_u32_list(pds["dout_insts"])):
@@ -1129,7 +1192,7 @@ def validate_pds_texstate(spec: Dict[str, Any], diags: List[Diagnostic], checks:
                     _err(
                         diags,
                         "PDS_DOUT_INVALID_OPCODE",
-                        f"PDS DOUT inst[{idx}]=0x{inst:08x} opcode 0x{op:08x} not in DOUTD/DOUTU/DOUTI",
+                        f"PDS DOUT inst[{idx}]=0x{inst:08x} opcode 0x{op:08x} not in DOUTD/DOUTW/DOUTU/DOUTC/DOUTI",
                         offset=idx * 4,
                     )
 
@@ -1495,6 +1558,7 @@ def validate_bundle(
                 diags,
                 checks,
                 require_terminate=bool(cdm_obj.get("require_terminate", True)),
+                is_substream=bool(cdm_obj.get("is_substream", False)),
             )
         else:
             validate_cdm_stream(cdm_obj, diags, checks)

@@ -146,12 +146,55 @@ class TestFreeCSValidate(unittest.TestCase):
     def test_catches_cdm_missing_terminate_and_unaligned_code_addr(self) -> None:
         b = copy.deepcopy(self.base)
         b["cdm"]["words"][2] |= 0x4  # misaligned code_addr
-        b["cdm"]["words"].pop()      # remove CDMCTRL_STREAM_TERMINATE
+        b["cdm"]["words"] = b["cdm"]["words"][:8]  # remove primary terminate kernel
         v = validate_bundle(b, workload="neg-cdm")
         self.assertFalse(v["pass"])
         codes = {d["code"] for d in v["diagnostics"]}
         self.assertIn("CDM_K2_CODE_UNALIGNED", codes)
         self.assertIn("CDM_MISSING_TERMINATE", codes)
+
+    def test_catches_volcanic_primary_stream_return_0x80000000_retest8(self) -> None:
+        # 1. Catch Retest #8: primary CDM stream ending in block_type=2 (0x80000000) pops CR 0x0598+0x180 -> va=0x0!
+        b = copy.deepcopy(self.base)
+        b["cdm"]["words"] = b["cdm"]["words"][:8] + [0x80000000]
+        v = validate_bundle(b, workload="neg-retest8-stream-return")
+        self.assertFalse(v["pass"])
+        self.assertLess(v["eval_ms"], 5.0)
+        self.assertIn("CDM_PRIMARY_STREAM_RETURN_FAULT", [d["code"] for d in v["diagnostics"]])
+
+        # 2. Sub-stream explicitly marked is_substream=True allows STREAM_RETURN (0x80000000)
+        b_sub = copy.deepcopy(self.base)
+        b_sub["cdm"] = {"words": b["cdm"]["words"][:8] + [0x80000000], "is_substream": True}
+        v_sub = validate_bundle(b_sub, workload="pos-retest8-substream-return")
+        self.assertTrue(v_sub["pass"], v_sub)
+        self.assertTrue(v_sub["checks"]["cdm_returned"])
+
+        # 3. Volcanic fence PDS DOUTC (0xF4001003) + DOUTD with non-zero doffset validate cleanly
+        b_pds = copy.deepcopy(self.base)
+        b_pds["pds"]["dout_insts"] = [0xF0001000, 0xF4001003]  # DOUTD + DOUTC
+        b_pds["pds"]["doutd_src1"] = 0x90100004  # last=1, dest=COMMON(1), doffset=128, bsize=4
+        v_pds = validate_bundle(b_pds, workload="pos-retest8-doutc-pds")
+        self.assertTrue(v_pds["pass"], v_pds)
+
+        # 4. Warn when 128-invocation compute kernel leaves wg_mode=0
+        b_wg = copy.deepcopy(self.base)
+        b_wg["cdm"]["words"][0] &= ~(0x3 << 20)
+        v_wg = validate_bundle(b_wg, workload="warn-wg128-wg-mode")
+        self.assertTrue(v_wg["pass"], v_wg)
+        self.assertIn("CDM_WG128_WG_MODE_ZERO", [d["code"] for d in v_wg["diagnostics"]])
+
+        # 5. Decode live Retest #8 MMU_FAULT_STATUS1/2 telemetry (va=0x0, req=CDM(0x15), pc=21/22)
+        for status1, expected_pc in ((0x9515000000000009, 21), (0x9516000000000009, 22)):
+            dec8 = decode_mmu_fault_status(status1, 0x8000)
+            self.assertTrue(dec8["valid"])
+            self.assertTrue(dec8["read"])
+            self.assertEqual(dec8["va"], 0x0)
+            self.assertEqual(dec8["level"], 2)
+            self.assertEqual(dec8["level_name"], "PC")
+            self.assertEqual(dec8["pc_ctx"], expected_pc)
+            self.assertEqual(dec8["req_id"], 0x15)
+            self.assertEqual(dec8["req_name"], "CDM")
+            self.assertEqual(dec8["bank"], 8)
 
     def test_catches_cdm_workgroup_invocations_over_512(self) -> None:
         b = copy.deepcopy(self.base)
