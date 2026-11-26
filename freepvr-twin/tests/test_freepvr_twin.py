@@ -28,9 +28,14 @@ from freepvr_twin.fixtures import (
     run_mesa_iadd_sg,
 )
 from freepvr_twin.freecs import (
+    MMUV4_AXCACHE_CACHED,
     ROGUE_CCCB_CTL_SIZE,
     ROGUE_CCCB_HDR_SIZE,
     TA_HEADER_SINGLE_VP_PROOF,
+    decode_mmu_fault_status,
+    encode_mmuv4_pce,
+    encode_mmuv4_pde,
+    encode_mmuv4_pte,
     ppp_expected_dwords,
     validate_bundle,
 )
@@ -202,6 +207,66 @@ class TestFreeCSValidate(unittest.TestCase):
         self.assertIn("PDS_DOUTD_ROGUE_SLCMODE_BIT62", codes)
         self.assertIn("TEXSTATE_UPSTREAM_14B_WIDTH_HEIGHT_DRIFT", codes)
         self.assertIn("TEXSTATE_ROGUE_SHIFT2_VA", codes)
+
+    def test_catches_laguna_false_dma_coherent_and_mmuv4_rogue_bits(self) -> None:
+        # 1. Catch Retest #6 false dma-coherent on Laguna gpu0 + Rogue MMU bits
+        b = copy.deepcopy(self.base)
+        b["mmuv4"]["gpu_dma_coherent"] = True
+        b["mmuv4"]["pce"] = encode_mmuv4_pce(0x88EFE8000) | (1 << 1)  # Rogue PC PENDING
+        b["mmuv4"]["pde"] = encode_mmuv4_pde(0x88EFE9000) | (1 << 40) | (1 << 1)  # Rogue PD PENDING + PAGESIZE
+        b["mmuv4"]["pte"] = encode_mmuv4_pte(0x88EFEA000, axcache=MMUV4_AXCACHE_CACHED) | (1 << 3) | (1 << 5)
+        v = validate_bundle(b, workload="neg-mmuv4-retest6")
+        self.assertFalse(v["pass"])
+        codes = {d["code"] for d in v["diagnostics"]}
+        self.assertIn("MMUV4_LAGUNA_FALSE_DMA_COHERENT", codes)
+        self.assertIn("MMUV4_PC_ROGUE_PENDING_BIT", codes)
+        self.assertIn("MMUV4_PD_ROGUE_PENDING_BIT", codes)
+        self.assertIn("MMUV4_PD_ROGUE_PAGESIZE_BITS", codes)
+        self.assertIn("MMUV4_PT_ROGUE_SLC_BYPASS_BIT", codes)
+        self.assertIn("MMUV4_PT_ROGUE_PENDING_BIT", codes)
+
+        # 2. Decode live Retest #6 MMU_FAULT_STATUS1/2 telemetry
+        dec = decode_mmu_fault_status(0x9515008000068009, 0x80B0)
+        self.assertTrue(dec["valid"])
+        self.assertTrue(dec["read"])
+        self.assertEqual(dec["va"], 0x8000068000)
+        self.assertEqual(dec["level"], 2)
+        self.assertEqual(dec["level_name"], "PC")
+        self.assertEqual(dec["pc_ctx"], 21)
+        self.assertEqual(dec["req_id"], 0x15)
+        self.assertEqual(dec["req_name"], "CDM")
+        self.assertEqual(dec["bank"], 8)
+        self.assertEqual(dec["type"], 0)
+
+    def test_catches_volcanic_cdm_stack_state_zero_and_overlap_retest7(self) -> None:
+        # 1. Catch Retest #7: CMDCDM+0x20 (CR 0x0598 CDM Stack State Base) == 0 -> CDM(0x1b) faults at va=0x180
+        b = copy.deepcopy(self.base)
+        b["fw_abi"]["cmd_cdm"]["cdm_stack_state_base"] = 0
+        v = validate_bundle(b, workload="neg-retest7-stack-zero")
+        self.assertFalse(v["pass"])
+        self.assertLess(v["eval_ms"], 5.0)
+        self.assertIn("CMDCDM_STACK_STATE_BASE_ZERO", [d["code"] for d in v["diagnostics"]])
+
+        # 2. Catch misalignment (<256B) and overlap with 1024B CDM Context State [0x8000043000..0x8000043400)
+        b2 = copy.deepcopy(self.base)
+        b2["fw_abi"]["cmd_cdm"]["cdm_stack_state_base"] = 0x8000043280
+        v2 = validate_bundle(b2, workload="neg-retest7-stack-align-overlap")
+        self.assertFalse(v2["pass"])
+        codes2 = {d["code"] for d in v2["diagnostics"]}
+        self.assertIn("CMDCDM_STACK_STATE_UNALIGNED", codes2)
+        self.assertIn("CMDCDM_STACK_STATE_OVERLAPS_CTX_STATE", codes2)
+
+        # 3. Decode live Retest #7 MMU_FAULT_STATUS1/2 telemetry (va=0x180, req=CDM(0x1b))
+        dec7 = decode_mmu_fault_status(0x9B15000000000189, 0x8400)
+        self.assertTrue(dec7["valid"])
+        self.assertTrue(dec7["read"])
+        self.assertEqual(dec7["va"], 0x180)
+        self.assertEqual(dec7["level"], 2)
+        self.assertEqual(dec7["level_name"], "PC")
+        self.assertEqual(dec7["pc_ctx"], 21)
+        self.assertEqual(dec7["req_id"], 0x1B)
+        self.assertEqual(dec7["req_name"], "CDM")
+        self.assertEqual(dec7["bank"], 8)
 
 
 class TestFreeUSCSim(unittest.TestCase):
