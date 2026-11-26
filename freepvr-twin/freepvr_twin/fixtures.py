@@ -297,14 +297,24 @@ def build_valid_freecs_bundle() -> Dict[str, Any]:
     # 1. Laguna 16B cCCB header + 16B payload (cmd_type=1 CDM, cmd_size=16)
     cccb_raw = struct.pack("<IIIIIIII", 1, 16, 0x101, 0x202, 0xC0000001, 0x00001000, 0x00002000, 0x00000001)
 
-    # 2. CDM: COMPUTE_KERNEL_EXT(3), 8-bit usc_unified_size=160, max_instances=128 (raw 127), ws=128x1x1 + TERMINATE
-    k0 = (3 << 30) | (1 << 28) | (1 << 27) | (2 << 20) | (160 << 12) | (4 << 7) | (8 << 1)
-    k1 = 0x00001000 | (1 << 2) | (1 << 1)  # data_addr=0x1000, sd_type=PDS, usc_common_shared=1
+    # 2. CDM: 128-lane compute kernel (block_type=0, wg_mode=1) + Volcanic primary
+    #    dealloc-fence-and-terminate block (block_type=3 + BIT(28) + BIT(27), sd_type=PDS, usc_common_shared=1)
+    k0 = (0 << 30) | (1 << 20) | (160 << 12) | (1 << 7) | (1 << 1) | 1
+    k1 = 0x00001000  # data_addr=0x1000, sd_type=NONE, usc_common_shared=0
     k2 = 0x00002000  # code_addr=0x2000 (16B aligned)
-    k3, k4, k5 = 1, 1, 1
-    k8 = (127 << 25) | (1 << 11) | 64
-    k9 = (127 << 20) | (0 << 10) | 0
-    cdm_term = 2 << 30
+    k3, k4, k5 = 0, 0, 0
+    k8 = (0 << 25) | (2 << 11) | 4  # max_instances=0 (128), event_type=2, usc_common_size=4
+    k9 = (127 << 20) | (0 << 10) | 0  # 128x1x1 workgroup
+    term_k = [
+        (3 << 30) | (1 << 28) | (1 << 27) | (1 << 1),  # 0xD8000002
+        0x00003000 | (1 << 2) | (1 << 1),              # data_addr=0x3000, sd_type=PDS, usc_common_shared=1
+        0x00003010,                                    # code_addr=0x3010 (DOUTC 0xF4001003 + HALT)
+        0,
+        0,
+        0,
+        (1 << 25),                                     # max_instances=1
+        0,
+    ]
 
     # 3. DCE QWORD stream: PPP_STATE_UPDATE(23 dw) + SHADER_STATE(VS) + SCISSOR + DRAW(indexed) + BARRIER + PPP terminate(3 dw)
     dce_ppp = (0x01 << 56) | (23 << 46) | (0x8000300004 >> 2)
@@ -381,7 +391,7 @@ def build_valid_freecs_bundle() -> Dict[str, Any]:
                 "cdm_stack_state_base": 0x8000043800,
             },
         },
-        "cdm": {"words": [k0, k1, k2, k3, k4, k5, k8, k9, cdm_term]},
+        "cdm": {"words": [k0, k1, k2, k3, k4, k5, k8, k9] + term_k},
         "dce": {
             "qwords": dce_qwords,
             "handle_entries": [dce_handle],
