@@ -1,0 +1,57 @@
+name: FreePVR CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  clean-room-audit:
+    name: Clean-Room & OSS Boundary Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run clean-room audit (0 violations required)
+        run: ./scripts/clean-room-audit.sh
+
+  offline-tests:
+    name: Offline FreeUSC & FreeCS Self-Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Python unittest suite
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Run CLI self-tests
+        run: |
+          python3 tools/freeusc/volcanic_bitdiff.py --self-test
+          python3 tools/freeusc/rgx_sh_parser.py --self-test
+          python3 tools/freeusc/gen_spirv_probes.py --self-test
+          python3 tools/freecs/freecs_packet_validator.py --self-test
+
+  build-sweeper-and-spirv:
+    name: C11 Sweeper Build & SPIR-V Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan headers, glslang-tools, and spirv-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libvulkan-dev glslang-tools spirv-tools
+
+      - name: Compile standalone C11 Vulkan probe sweeper
+        run: |
+          mkdir -p build
+          gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            -o build/vk_pipeline_cache_sweeper \
+            probes/vk_pipeline_cache_sweeper.c -lvulkan
+
+      - name: Regenerate & spirv-val all 33 paired-twin compute probes
+        run: |
+          python3 tools/freeusc/gen_spirv_probes.py \
+            --out-dir build/spirv-check \
+            --target-env vulkan1.2

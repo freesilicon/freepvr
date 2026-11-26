@@ -1,0 +1,16 @@
+#version 460
+// SPDX-License-Identifier: Apache-2.0
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(std430, set = 0, binding = 0) buffer ProbeBufF {
+    float in_a[256];
+    float in_b[256];
+    float in_c[256];
+    float out_v[256];
+} buf;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    float a = buf.in_a[idx];
+    float b = buf.in_b[idx];
+    float r = a * b;
+    buf.out_v[idx] = r;
+}
